@@ -2,480 +2,586 @@
 
 pragma solidity >=0.8.0;
 
-interface IERC20 {
-  function transfer(address to, uint256 value) external returns (bool);
-  function balanceOf(address who) external view returns (uint256);
-  function approve(address spender, uint256 value) external returns (bool);
-}
+import "./interfaces/IERC20.sol";
+import "./interfaces/IWETH.sol";
+import "./interfaces/IUniswapV1Exchange.sol";
+import "./interfaces/IUniswapV2Pair.sol";
+import "./interfaces/IUniswapV2Callee.sol";
 
-interface IWETH is IERC20 {
-    function deposit() external payable;
-    function withdraw(uint) external;
-}
-
-interface ISunswapV1Factory {
-    function getExchange(address token) external view returns (address payable);
-}
-
-interface ISunswapV2Factory {
-    function getPair(address tokenA, address tokenB) external view returns (address pair);
-}
-
-interface ISunswapV1Exchange {
-    function tokenToTrxSwapInput(uint tokens_sold, uint min_trx, uint deadline) external returns (uint);
-    function trxToTokenTransferInput(uint, uint, address) external payable returns(uint);
-}
-
-interface ISunswapV2Pair {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
-}
-
-interface IUniswapV2Callee {
-    function sunswapV2Call(address sender, uint amount0, uint amount1, bytes calldata data) external;
-}
+import "./libraries/Math.sol";
+import "./libraries/Utils.sol";
+import "./libraries/UniswapUtil.sol";
+import "./libraries/SafeMath.sol";
+import "./libraries/UQ112x112.sol";
+import "./libraries/Constants.sol";
 
 contract Optimized is IUniswapV2Callee {
-    ISunswapV1Factory private constant factoryV1 = ISunswapV1Factory(0xeEd9e56a5CdDaA15eF0C42984884a8AFCf1BdEbb);
-    ISunswapV2Factory private constant factoryV2 = ISunswapV2Factory(0x689AbaeeEd3F0BB3585773192e23224CAC25Dd41);
-    address private constant WRAPPED_TRX = 0x891cdb91d149f23B1a45D9c5Ca78a88d0cB44C18;
+// contract Optimized {
+    
+    using SafeMath  for uint;
+    using UQ112x112 for uint224;
+    
+    // Mainnet
+    // IUniswapV1Factory internal constant factoryV1 = IUniswapV1Factory(0xeEd9e56a5CdDaA15eF0C42984884a8AFCf1BdEbb);
+    // IUniswapV2Factory internal constant factoryV2 = IUniswapV2Factory(0x689AbaeeEd3F0BB3585773192e23224CAC25Dd41);
+    // address internal constant WRAPPED_TRX = 0x891cdb91d149f23B1a45D9c5Ca78a88d0cB44C18;
+    
+    //Testnet
+    // IUniswapV1Factory private constant factoryV1 = IUniswapV1Factory(0xE97E6ee12d3db8176242BB901fdB924cC938e2D9);
+    // IUniswapV2Factory private constant factoryV2 = IUniswapV2Factory(0xc3bdaC99dFca480483f747D86Ee074BCFfe9Be55);
+    // address private constant WRAPPED_TRX = 0xfb3b3134F13CcD2C81F4012E53024e8135d58FeE;
     address private owner;
     
     constructor() {
         owner = msg.sender; // 'msg.sender' is sender of current call, contract deployer for a constructor
     }
     
-    function sqrt(uint y) private pure returns (uint z) {
-        if (y > 3) {
-            z = y;
-            uint x = y / 2 + 1;
-            while (x < z) {
-                z = x;
-                x = (y / x + x) / 2;
-            }
-        } else if (y != 0) {
-            z = 1;
-        }
-    }
-    
-    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) private pure returns (uint amountIn) {
-        uint numerator = reserveIn * amountOut * 1000;
-        uint denominator = (reserveOut - amountOut) * 997;
-        amountIn = numerator / denominator + 1;
-    }
-    
-    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) private pure returns (uint amountOut) {
-        uint amountInWithFee = amountIn * 997;
-        uint numerator = amountInWithFee * reserveOut;
-        uint denominator = reserveIn * 1000 + amountInWithFee;
-        amountOut = numerator / denominator;
-    }
-    
-    function getReservesV1(address token) private view returns(uint112 reserve0, uint112 reserve1, address pair) {
-        pair = factoryV1.getExchange(token);
-        
-        if (pair == address(0)) {
-            return (0, 0, address(0));
-        }
-        
-        reserve0 = uint112(pair.balance);
-        reserve1 = uint112(IERC20(token).balanceOf(pair));
-    }
-    
-    function getReservesV2(address token0, address token1) private view returns (uint112 reserveIn, uint112 reserveOut, address pair) {
-        pair = factoryV2.getPair(token0, token1);
-        
-        if (pair == address(0)) {
-            return (0, 0, address(0));
-        }
-
-        (reserveIn, reserveOut, ) = ISunswapV2Pair(pair).getReserves();
-        if (token0 > token1) {
-            (reserveIn, reserveOut) = (reserveOut, reserveIn);
-        }
-    }
-    
-    function getReserves2(address token0, address token1) private view returns (uint112[5] memory X, uint112[5] memory Y) {
-        (X[0], Y[0], ) = getReservesV1(token0);
-        (X[1], Y[1], ) = getReservesV2(WRAPPED_TRX, token0);
-        (X[2], Y[2], ) = getReservesV2(token0, token1);
-        (Y[3], X[3], ) = getReservesV1(token1);
-        (X[4], Y[4], ) = getReservesV2(token1, WRAPPED_TRX);
-    }
-    
-    function swapV2(address token0, address token1, uint amountIn, uint amountOut, address to, bytes memory data) private returns (uint) {
-        address pair = factoryV2.getPair(token0, token1);
-
-        bool direction = token0 < token1;
-        
-        if (amountOut == 0) {
-            uint reserveIn;
-            uint reserveOut;
-            (reserveIn, reserveOut, ) = ISunswapV2Pair(pair).getReserves();
-            if (direction == false) {
-                (reserveIn, reserveOut) = (reserveOut, reserveIn);
-            }
-            
-            amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
-        }
-        
-        if (amountIn > 0) {
-            IERC20(token0).transfer(pair, amountIn);
-        }
-        
-        {
-            uint amount0;
-            uint amount1;
-            (amount0, amount1) = direction ? (uint(0), amountOut) : (amountOut, uint(0));
-            ISunswapV2Pair(pair).swap(amount0, amount1, to, data);
-        }
-        
-        return amountOut;
-    }
-    
-    function calc(uint C1, uint C2, uint C3) private pure returns (uint x, uint k) {
-        uint temp = (C1 - C3);
-        x = temp * C3 / C2;
-        k = temp * temp / C2;
-    }
-    
-    function calc1(uint X1, uint Y1, uint X2, uint Y2) private pure returns (uint x, uint k) {
-        uint C1 = sqrt(Y1 * Y2 * 994009);
-        uint C3 = sqrt(X1 * X2 * 1000000);
-        
-        if (C1 < C3) {
+    function calc1(uint X1, uint Y1, uint X2, uint Y2) internal pure returns (uint k, uint x) {
+        if (X1 == 0 || Y1 == 0 || X2 == 0 || Y2 == 0) {
             return (0, 0);
         }
         
+        uint C1 = Y1 * Y2 * 994009;
+        uint C3 = X1 * X2 * 1000000;
+        
+        if (C1 <= C3) {
+            return (0, 0);
+        }
+        
+        C1 = Math.sqrt(C1);
+        C3 = Math.sqrt(C3);
         uint C2 = X2 * 997000 + Y1 * 994009;
         
-        (x, k) = calc(C1, C2, C3);
+        uint temp = C1 - C3;
+        
+        k = temp * temp / C2;
+        x = temp * C3 / C2;
     }
     
-    function calc2(uint X1, uint Y1, uint X2, uint Y2, uint X3, uint Y3) private pure returns (uint x, uint k) {
-        uint C1 = sqrt(Y1 * Y2) * sqrt(Y3 * 991026973);
-        uint C3 = sqrt(X1 * X2) * sqrt(X3 * 1000000000);
+    function expect1(address token, uint flag, uint amount, uint percent, uint inAmount, uint limit) external view returns(address pair0, address pair1, uint outAmount, uint k, uint x) {
+        // flag & 1 => direction 0 - (trx->token->wtrx)wtrx->token detected 1(wtrx->token->trx) - token->wtrx detected
+        // flag & 2 => 0 - in determined 1 - out determined
+        // percent = 8
+   
+        uint[2] memory X;
+        uint[2] memory Y;
         
-        if (C1 < C3) {
-            return (0, 0);
-        }
-        
-        uint C2 = 997000000 * X2 * X3 + (X3 * 994009000 + Y2 * 991026973) * Y1;
-        
-        (x, k) = calc(C1, C2, C3);
-    }
-    
-    function expect1(address token, uint reserve) external view returns (uint k, uint r) {
-        
-        if (msg.sender != owner) {
-            return (0, 0);
-        }
-        // require(msg.sender == owner, "Not owner");
-        
-        uint112 amount0 = uint112(reserve);
-        uint112 amount1 = uint112(reserve >> 112);
-        uint flag = reserve >> 224;
-        
-        if (flag >=4) {
-            return (0, 0);
-        }
-        // require(flag < 4, "Invalid Input");
-        
-        uint X1;
-        uint Y1;
-        uint X2;
-        uint Y2;
-        
-        (X1, Y1, ) = getReservesV1(token);
-        
-        r = Y2;
+        (X[0], Y[0], pair0) = UniswapUtil.getReservesV1(token);
+        (X[1], Y[1], pair1) = UniswapUtil.getReservesV2(Constants.WRAPPED_TRX, token);
         
         if (flag & 1 == 0) {
-            (X2, Y2, ) = getReservesV2(token, WRAPPED_TRX);
+            // detect wtrx -> token reserves are X[1], Y[1]
+            
+            if (amount > 0) {
+                uint amountIn;
+                uint amountOut;
+                if (flag & 2 == 0) {
+                    // inAmount determined
+                    amountIn = amount;
+                    amountOut = UniswapUtil.getAmountOut(amountIn, X[1], Y[1]);
+                } else {
+                    // outAmount determined
+                    amountOut = amount;
+                    amountIn = UniswapUtil.getAmountIn(amountOut, X[1], Y[1]);
+                }
+    
+                if (amountIn * 1000 >= X[1] * percent) {
+                    outAmount = UniswapUtil.getAmountOut(inAmount, X[1], Y[1]);
+                }
+    
+                X[1] += amountIn;
+                Y[1] -= amountOut;
+            }
+            
+            // expect trx -> token -> wtrx
+            (k, x) = calc1(X[0], Y[0], Y[1], X[1]);
         } else {
-            (X2, Y2, ) = getReservesV2(WRAPPED_TRX, token);
-        }
-        
-        if (X1 == 0 || X2 == 0 || Y1 == 0 || Y2 == 0) {
-            return (0, 0);
-        }
-
-        // require(X1 > 0 && X2 > 0 && Y1 > 0 && Y2 > 0, "Invalid Pair");
-        
-        if (amount0 > 0 || amount1 > 0) {
-            if (flag & 2 == 0) {
-                uint112 amountOut = uint112(getAmountOut(amount0, Y2, X2));
-                if (amountOut <= amount1) {
-                    return (0, 0);
+            // detect token -> wtrx
+            
+            if (amount > 0) {
+                uint amountIn;
+                uint amountOut;
+                if (flag & 2 == 0) {
+                    // inAmount determined
+                    amountIn = amount;
+                    amountOut = UniswapUtil.getAmountOut(amountIn, Y[1], X[1]);
+                } else {
+                    // outAmount determined
+                    amountOut = amount;
+                    amountIn = UniswapUtil.getAmountIn(amountOut, Y[1], X[1]);
                 }
-                // require(amountOut > amount1, "Low possibility");
-                X2 -= amountOut;
-                Y2 += amount0;
-            } else {
-                uint112 amountIn = uint112(getAmountIn(amount0, Y2, X2));
-                if (amount1 <= amountIn) {
-                    return (0, 0);
-                }
-                // require(amountIn < amount1, "Low possibility");
-                Y2 += amountIn;
-                X2 -= amount0;
+                X[1] -= amountOut;
+                Y[1] += amountIn;
+                (k, x) = calc1(X[1], Y[1], Y[0], X[0]);
             }
         }
-
-        if (flag & 1 == 0) {
-            (X1, Y1, X2, Y2) = (X1, Y1, X2, Y2);
-            // (X1, Y1, ) = getReservesV1(token);
-            // (X2, Y2, ) = getReservesV2(token, WRAPPED_TRX);
-        } else {
-            (X1, Y1, X2, Y2) = (X2, Y2, Y1, X1);
-            // (X1, Y1, ) = getReservesV2(WRAPPED_TRX, token);
-            // (Y2, X2, ) = getReservesV1(token);
+        
+        if (x > 0 && k >= limit) {
+            x = uint(flag) << 224 | uint(limit) << 112 | x;
         }
-        
-        uint x;
-        
-        (x, k) = calc1(X1, Y1, X2, Y2);
-        
-        uint y2 = x + k;
-        uint y1 = getAmountIn(y2, X2, Y2);
-        uint y0 = getAmountIn(y1, X1, Y1);
-        
-        if (y0 >= y2) {
-            return (0, 0);
-        }
-        
-        uint y = flag & 1 == 0 ? y2 : y1;
-        k = y2 - y0;
-        r = (flag & 1) << 224 | y << 112 | r;
     }
     
-    function expect2(address token0, address token1, uint reserve) external view returns (uint k, uint r) {
-        
-        require(msg.sender == owner, "Not owner");
-        
-        uint112 amount0 = uint112(reserve);
-        uint112 amount1 = uint112(reserve >> 112);
-        uint flag = reserve >> 224;
-        
-        require(flag < 4, "Invalid Input");
-        
-        (uint112[5] memory X, uint112[5] memory Y) = getReserves2(token0, token1);
-        
-        require(X[2] > 0 && Y[2] > 0, "Invalid Pair");
-        
-        r = Y[2];
-        
-        if (amount0 > 0 || amount1 > 0) {
-            if (flag == 0) {
-                uint112 amountOut = uint112(getAmountOut(amount0, Y[2], X[2]));
-                require(amountOut > amount1, "Low possibility");
-                X[2] -= amountOut;
-                Y[2] += amount0;
-            } else { // 2
-                uint112 amountIn = uint112(getAmountIn(amount0, Y[2], X[2]));
-                require(amountIn < amount1, "Low possibility");
-                Y[2] += amountIn;
-                X[2] -= amount0;
-            }
+    function calc2(uint X1, uint Y1, uint X2, uint Y2, uint X3, uint Y3) internal pure returns (uint k, uint x) {
+        if (X1 == 0 || Y1 == 0 || X2 == 0 || Y2 == 0 || X3 == 0 || Y3 == 0) {
+            return (0, 0);
         }
+        
+        uint C1 = (Y1 * Y2 * 991026973).mul(Y3);
+        uint C3 = (X1 * X2 * 1000000000).mul(X3);
+        
+        if (C1 <= C3) {
+            return (0, 0);
+        }
+        
+        C1 = Math.sqrt(C1);
+        C3 = Math.sqrt(C3);
+        uint C2 = X2 * X3 * 997000000 + Y1 * X3 * 994009000 + Y1 * Y2 * 991026973;
+        
+        uint temp = C1 - C3;
+        
+        k = temp * temp / C2;
+        x = temp * C3 / C2;
+    }
+    
+    function expect2(address token0, address token1, uint amount, uint limit, uint flag) external view returns(address pair0, address pair1, address pair2, uint k, uint x) {
 
-        uint x;
+        uint[5] memory X;
+        uint[5] memory Y;
+        address[4] memory pair;
         uint route;
         
-        for (uint8 i = 0; i < 2; i ++) {
-            if (X[i] == 0) {
-                continue;
-            }
+        (X[2], Y[2], pair1) = UniswapUtil.getReservesV2(token0, token1);
+
+        if (pair[2] != address(0)) {
             
-            for (uint8 j = 3; j < 5; j ++) {
-                if (X[j] == 0) {
-                    continue;
+            if (amount > 0) {
+                // detect token1 -> token0 reserves are Y[2], X[2]
+                
+                uint amountIn;
+                uint amountOut;
+                
+                if (flag == 0) {
+                    // inAmount determined
+                    
+                    amountIn = amount;
+                    amountOut = UniswapUtil.getAmountOut(amountIn, Y[2], X[2]);
+                } else {
+                    // outAmount determined
+                    
+                    amountOut = amount;
+                    amountIn = UniswapUtil.getAmountIn(amountOut, Y[2], X[2]);
                 }
                 
-                uint tempX;
-                uint tempK;
-                (tempX, tempK) = calc2(X[i], Y[i], X[2], Y[2], X[j], Y[j]);
-                if (tempK > k) {
-                    (x, k) = (tempX, tempK);
-                    route = (i << 1) + (j - 3);
+                X[2] -= amountOut;
+                Y[2] += amountIn;
+            }
+            
+    
+            (X[0], Y[0], pair[0]) = UniswapUtil.getReservesV1(token0);
+            (X[1], Y[1], pair[1]) = UniswapUtil.getReservesV2(Constants.WRAPPED_TRX, token0);
+            (Y[3], X[3], pair[2]) = UniswapUtil.getReservesV1(token1);
+            (X[4], Y[4], pair[3]) = UniswapUtil.getReservesV2(token1, Constants.WRAPPED_TRX);
+            
+            if (pair[0] != address(0)) {
+                if (pair[2] != address(0)) {
+                    uint tempk;
+                    uint tempx;
+                    
+                    (tempk, tempx) = calc2(X[0], Y[0], X[2], Y[2], X[3], Y[3]);
+                    
+                    if (tempk > k) {
+                        k = tempk;
+                        x = tempx;
+                        route = 0;
+                        pair0 = pair[0];
+                        pair2 = pair[2];
+                    }
+                }
+                if (pair[3] != address(0)) {
+                    uint tempk;
+                    uint tempx;
+                    
+                    (tempk, tempx) = calc2(X[0], Y[0], X[2], Y[2], X[4], Y[4]);
+                    
+                    if (tempk > k) {
+                        k = tempk;
+                        x = tempx;
+                        route = 2;
+                        pair0 = pair[0];
+                        pair2 = pair[3];
+                    }
                 }
             }
-        }
-        
-        if (k > 0) {
-            uint i = (route & 2) >> 1;
-            uint j = (route & 1) + 3;
-
-            uint y3 = x + k;
-            uint y2 = getAmountIn(y3, X[j], Y[j]);
-            uint y1 = getAmountIn(y2, X[2], Y[2]);
-            uint y0 = getAmountIn(y1, X[i], Y[i]);
             
-            k = y3 - y0;
-            r = route << 224 | y2 << 112 | r;
+            if (pair[1] != address(0)) {
+                if (pair[2] != address(0)) {
+                    uint tempk;
+                    uint tempx;
+                    
+                    (tempk, tempx) = calc2(X[1], Y[1], X[2], Y[2], X[3], Y[3]);
+                    
+                    if (tempk > k) {
+                        k = tempk;
+                        x = tempx;
+                        route = 1;
+                        pair0 = pair[1];
+                        pair2 = pair[2];
+                    }
+                }
+                if (pair[3] != address(0)) {
+                    uint tempk;
+                    uint tempx;
+                    
+                    (tempk, tempx) = calc2(X[1], Y[1], X[2], Y[2], X[4], Y[4]);
+                    
+                    if (tempk > k) {
+                        k = tempk;
+                        x = tempx;
+                        route = 3;
+                        pair0 = pair[1];
+                        pair2 = pair[3];
+                    }
+                }
+            }
+            
+            if (k >= limit && x > 0) {
+                x = uint(route) << 224 | uint(limit) << 112 | x;
+            }
         }
     }
     
-    function run1(address token, uint r) external {
+    function front(address pair, address token, uint reserve) external payable {
+        require(msg.value == 1);
         
-        require(msg.sender == owner, "Not owner");
+        uint inAmount = uint112(reserve);
+        uint outAmountMin = uint112(reserve >> 112);
         
-        uint Y1;
-        address token0;
-        address token1;
-        uint112 Y = uint112(r);
-        uint112 y = uint112(r >> 112);
-        uint8 route = uint8(r >> 224);
+        uint reserve0;
+        uint reserve1;
+        bool direction = Constants.WRAPPED_TRX < token;
+        (reserve0, reserve1, ) = IUniswapV2Pair(pair).getReserves();
+        if (direction == false) {
+            (reserve0, reserve1) = (reserve1, reserve0);
+        }
         
-        require(route < 4, "Invalid Input");
+        uint outAmount = UniswapUtil.getAmountOut(inAmount, reserve0, reserve1);
+        require(outAmount >= outAmountMin);
         
-        if (route & 1 == 0) {
-            (token0, token1) = (token, WRAPPED_TRX);
+        uint out0;
+        uint out1;
+        
+        (out0, out1) = direction ? (uint(0), outAmount) : (outAmount, uint(0));
+        
+        IERC20(Constants.WRAPPED_TRX).transfer(pair, inAmount);
+        IUniswapV2Pair(pair).swap(out0, out1, address(this), new bytes(0));
+    }
+    
+    function back(address pair, address token, uint outAmountMin) external {
+        
+        payable(msg.sender).transfer(1);
+
+        bool direction = token < Constants.WRAPPED_TRX;
+
+        uint reserve0;
+        uint reserve1;
+
+        (reserve0, reserve1, ) = IUniswapV2Pair(pair).getReserves();
+        if (direction == false) {
+            (reserve0, reserve1) = (reserve1, reserve0);
+        }
+        
+        uint inAmount = IERC20(token).balanceOf(address(this));
+
+        uint outAmount = UniswapUtil.getAmountOut(inAmount, reserve0, reserve1);
+
+        require(outAmount >= outAmountMin);
+        
+        uint out0;
+        uint out1;
+        
+        (out0, out1) = direction ? (uint(0), outAmount) : (outAmount, uint(0));
+        
+        IERC20(token).transfer(pair, inAmount);
+        IUniswapV2Pair(pair).swap(out0, out1, address(this), new bytes(0));
+    }
+    
+    function liquidate(address pair0, address pair1, address token) external {
+
+        uint balance = address(this).balance;
+
+        if (balance > 0) {
+            payable(msg.sender).transfer(balance);
+        }
+        
+        uint reserve0;
+        uint reserve1;
+        uint reserve2;
+        uint reserve3;
+        
+        uint outAmount1;
+        
+        uint inAmount = IERC20(pair0).balanceOf(address(this));
+        
+        require(inAmount > 0, "No balance");
+        
+        if (pair0 != address(0)) {
+            reserve0 = IERC20(token).balanceOf(pair1);
+            reserve1 = address(pair1).balance;
+            outAmount1 = UniswapUtil.getAmountOut(inAmount, reserve0, reserve1);
+        }
+        
+        uint outAmount2;
+        bool direction;
+        if (pair1 != address(0)) {
+            
+            direction = token < Constants.WRAPPED_TRX;
+    
+            (reserve2, reserve3, ) = IUniswapV2Pair(pair1).getReserves();
+            if (direction == false) {
+                (reserve2, reserve3) = (reserve3, reserve2);
+            }
+    
+            outAmount2 = UniswapUtil.getAmountOut(inAmount, reserve2, reserve3);
+        }
+        
+        require(outAmount1 > 0 || outAmount2 > 0, "Pairs not exist");
+        
+        if (outAmount1 > outAmount2) {
+            IERC20(token).approve(pair0, inAmount);
+            uint amountOut = IUniswapV1Exchange(pair0).tokenToTrxSwapInput(inAmount, outAmount1, block.timestamp);
+            IWETH(Constants.WRAPPED_TRX).withdraw(amountOut);
         } else {
-            (token0, token1) = (WRAPPED_TRX, token);
+            uint out0;
+            uint out1;
+            
+            (out0, out1) = direction ? (uint(0), outAmount2) : (outAmount2, uint(0));
+            
+            IERC20(token).transfer(pair1, inAmount);
+            IUniswapV2Pair(pair1).swap(out0, out1, address(this), new bytes(0));
+        }
+    }
+    
+    function run1(address pair0, address pair1, address token, uint reserve) external {
+        
+        require(pair0 != address(0), "Invalid Pair");
+        require(pair1 != address(0), "Invalid pair");
+        
+        uint112 x = uint112(reserve);
+        uint112 limit = uint112(reserve >> 112);
+        uint8 flag = uint8(reserve >> 224);
+
+        uint reserve0 = pair0.balance;
+        uint reserve1 = IERC20(token).balanceOf(pair0);
+        uint reserve2;
+        uint reserve3;
+        
+        (reserve2, reserve3, ) = IUniswapV2Pair(pair1).getReserves();
+        
+        if (token < Constants.WRAPPED_TRX) {
+            (reserve2, reserve3) = (reserve3, reserve2);
         }
         
-        (, Y1, ) = getReservesV2(token0, token1);
-        require(Y < Y1, "Yet");
+        uint112 y1;
+        uint112 y2;
         
-        bytes memory data = new bytes(1);
-        data[0] = bytes1(route);
+        if (flag & 1 == 0) {
+            y1 = uint112(UniswapUtil.getAmountOut(x, reserve0, reserve1));
+            y2 = uint112(UniswapUtil.getAmountOut(y1, reserve3, reserve2));
+        } else {
+            y1 = uint112(UniswapUtil.getAmountOut(x, reserve2, reserve3));
+            y2 = uint112(UniswapUtil.getAmountOut(y1, reserve1, reserve0));
+        }
+        
+        require(y2 > x && y2 - x > limit, "No profit");
 
-        swapV2(token0, token1, 0, y, address(this), data);
+        bytes memory data = abi.encode(uint(x) << 112 | y1, uint(flag) << 112 | y2, pair0, token);
+
+        uint amount0;
+        uint amount1;
+        
+        if (flag & 1 == 0) {
+            if (Constants.WRAPPED_TRX < token) {
+                (amount0, amount1) = (y2, 0);
+            } else {
+                (amount0, amount1) = (0, y2);
+            }
+        } else {
+            if (Constants.WRAPPED_TRX < token) {
+                (amount0, amount1) = (0, y1);
+            } else {
+                (amount0, amount1) = (y1, 0);
+            }
+        }
+
+        IUniswapV2Pair(pair1).swap(amount0, amount1, address(this), data);
     }
     
-    function run2(address token0, address token1, uint r) external {
+    function run2(address pair0, address pair1, address pair2, address token0, address token1, uint reserve) external {
         
-        require(msg.sender == owner, "Not owner");
+        require(pair0 != address(0), "Invalid Pair");
+        require(pair1 != address(0), "Invalid pair");
+        require(pair2 != address(0), "Invalid pair");
         
-        uint112 Y = uint112(r);
-        uint112 y = uint112(r >> 112);
-        uint8 route = uint8(r >> 224);
+        uint112 x = uint112(reserve);
+        uint112 limit = uint112(reserve >> 112);
+        uint8 flag = uint8(reserve >> 224);
         
-        require(route < 4, "Invalid Input");
-        
-        uint112 Y2;
-        (, Y2, ) = getReservesV2(token0, token1);
-        
-        require(Y < Y2, "Yet");
-
-        bytes memory data = new bytes(1);
-        data[0] = bytes1(route | 4);
-        swapV2(token0, token1, 0, y, address(this), data);
-    }
-    
-    function sunswapV2Call(address sender, uint amount0, uint amount1, bytes calldata data) override external {
-        require(data.length == 1, "Invalid Input");
-        require(sender == address(this), "Invalid sender");
-        
-        uint flag = uint(uint8(data[0]));
-        
-        require(flag < 8, "Invalid Input");
-        
-        address token0;
-        address token1;
+        // flag  00 : pair2 pair0
         
         uint y1;
-        uint y2;
-            
-        (token0, token1, y2) = amount0 == 0 ? 
-            (ISunswapV2Pair(msg.sender).token0(), ISunswapV2Pair(msg.sender).token1(), amount1) : 
-            (ISunswapV2Pair(msg.sender).token1(), ISunswapV2Pair(msg.sender).token0(), amount0);
-            
         {
-            uint reserveIn;
-            uint reserveOut;
-            (reserveIn, reserveOut, ) = ISunswapV2Pair(msg.sender).getReserves();
-            if (amount0 != 0) {
-                (reserveIn, reserveOut) = (reserveOut, reserveIn);
-            }
-            y1 = getAmountIn(y2, reserveIn, reserveOut);
-        }
-        
-        if (flag & 4 == 0) {
-            if (flag == 0) {
-                uint X;
-                uint Y;
-                address pair;
-                (X, Y, pair) = getReservesV1(token0);
-                uint y0 = getAmountIn(y1, X, Y);
-                require(y0 < y2, "No3");
-                IWETH(WRAPPED_TRX).withdraw(y2);
-                ISunswapV1Exchange(pair).trxToTokenTransferInput{value: y0}(1, block.timestamp, msg.sender);
-            } else {
-                address pair = factoryV1.getExchange(token1);
-                IERC20(token1).approve(pair, y2);
-                uint y3 = ISunswapV1Exchange(pair).tokenToTrxSwapInput(y2, 1, block.timestamp);
-                require(y3 > y1, "No3");
-                IWETH(WRAPPED_TRX).deposit{value: y1}();
-                IERC20(WRAPPED_TRX).transfer(msg.sender, y1);
-            }
-        } else {
-            
-            uint x;
-            uint y3;
-            
-            flag = flag & 3;
+            uint reserve0;
+            uint reserve1;
             
             if (flag & 1 == 0) {
-                address pair = factoryV1.getExchange(token1);
-                IERC20(token1).approve(pair, y2);
-                y3 = ISunswapV1Exchange(pair).tokenToTrxSwapInput(y2, 1, block.timestamp);
+                reserve0 = pair0.balance;
+                reserve1 = IERC20(token0).balanceOf(pair0);
             } else {
-                y3 = swapV2(token1, WRAPPED_TRX, y2, 0, address(this), new bytes(0));
-            }
-            
-            address pair0;
-            
-            {
-                uint reserveIn;
-                uint reserveOut;
+                (reserve0, reserve1, ) = IUniswapV2Pair(pair0).getReserves();
                 
-                if (flag & 2 == 0) {
-                    pair0 = factoryV1.getExchange(token0);
-                    reserveIn = pair0.balance;
-                    reserveOut = IERC20(token0).balanceOf(pair0);
-                } else {
-                    (reserveIn, reserveOut, pair0) = getReservesV2(WRAPPED_TRX, token0);
+                if (token0 < Constants.WRAPPED_TRX) {
+                    (reserve0, reserve1) = (reserve1, reserve0);
                 }
-                
-                x = getAmountIn(y1, reserveIn, reserveOut);
             }
+            y1 = uint112(UniswapUtil.getAmountOut(x, reserve0, reserve1));
+        }
+
+        uint y2;        
+        {
+            uint reserve2;
+            uint reserve3;
+            (reserve2, reserve3, ) = IUniswapV2Pair(pair1).getReserves();
             
-            if (flag == 1) {
-                IWETH(WRAPPED_TRX).withdraw(y3);
-            } else if (flag == 2) {
-                IWETH(WRAPPED_TRX).deposit{value: x}();
-            } else if (flag == 3) {
-                IWETH(WRAPPED_TRX).withdraw(y3 - x);
+            if (token1 < token0) {
+                (reserve2, reserve3) = (reserve3, reserve2);
             }
-            
+            y2 = uint112(UniswapUtil.getAmountOut(y1, reserve2, reserve3));
+        }
+        
+        uint y3;
+        {
+            uint reserve4;
+            uint reserve5;
             if (flag & 2 == 0) {
-                ISunswapV1Exchange(pair0).trxToTokenTransferInput{value: x}(1, block.timestamp, msg.sender);
+                reserve4 = IERC20(token1).balanceOf(pair2);
+                reserve5 = pair2.balance;
             } else {
-                IERC20(WRAPPED_TRX).transfer(pair0, x);
-                (amount0, amount1) = WRAPPED_TRX < token0 ? (uint(0), y1) : (y1, uint(0));
-                ISunswapV2Pair(pair0).swap(amount0, amount1, msg.sender, new bytes(0));
+                (reserve4, reserve5, ) = IUniswapV2Pair(pair2).getReserves();
+                
+                if (Constants.WRAPPED_TRX < token1) {
+                    (reserve5, reserve4) = (reserve4, reserve5);
+                }
             }
+            y3 = uint112(UniswapUtil.getAmountOut(y2, reserve4, reserve5));
+        }
+        
+        require(y3 > x && y3 > limit, "No profit");
+        
+        bytes memory data = abi.encode(uint(x) << 112 | y1, uint(flag) << 224 | uint(y2) << 112 | y3, pair0, pair2, token0, token1);
+        uint amount0;
+        uint amount1;
+        (amount0, amount1) = (token0 < token1) ? (uint(0), y2) : (y2, uint(0));
+        
+        IUniswapV2Pair(pair1).swap(amount0, amount1, address(this), data);
+    }
+    
+    function approve(address token, address spender, uint amount) internal {
+        uint allowance = IERC20(token).allowance(address(this), spender);
+        
+        if (allowance < amount) {
+            IERC20(token).approve(spender, type(uint256).max);
         }
     }
     
-    function withdraw(address payable _to) external {
-        require(msg.sender == owner, "Not owner");
-        _to.transfer(address(this).balance);
+    function uniswapV2Call(address sender, uint amount0, uint amount1, bytes calldata data) override external {
+        
+        require(sender == address(this), "Invalid sender");
+        
+        uint amount = amount0 + amount1;
+
+        if (data.length == 128) {
+            // run1
+            uint x;
+            uint y1;
+            uint y2;
+            address pair;
+            address token;
+            uint8 flag;
+            uint d1;
+            uint d2;
+            (d1, d2, pair, token) = abi.decode(data, (uint, uint, address, address));
+            x = uint112(d1 >> 112);
+            y1 = uint112(d1);
+            y2 = uint112(d2);
+            flag = uint8(d2 >> 112);
+            
+            if (flag & 1 == 0) {
+                require(amount >= y2, "Fee token");
+                IWETH(Constants.WRAPPED_TRX).withdraw(x);
+                require(address(this).balance >= x, "TRX");
+                IUniswapV1Exchange(pair).trxToTokenTransferInput{value: x}(y1, block.timestamp, msg.sender);
+            } else {
+                require(amount >= y1, "Fee token");
+                IERC20(token).approve(pair, y1);
+                IUniswapV1Exchange(pair).tokenToTrxSwapInput(y1, y2, block.timestamp);
+                IWETH(Constants.WRAPPED_TRX).deposit{value: y2}();
+                IERC20(Constants.WRAPPED_TRX).transfer(msg.sender, x);
+            }
+        }
+        else if (data.length == 192) {
+            // run2
+            uint d1;
+            uint d2;
+            address pair0;
+            address pair2;
+            address token0;
+            address token1;
+            
+            (d1, d2, pair0, pair2, token0, token1) = abi.decode(data, (uint, uint, address, address, address, address));
+            uint x = uint112(d1 >> 112);
+            uint y1 = uint112(d1);
+            uint y2 = uint112(d2 >> 112);
+            uint y3 = uint112(d2);
+            uint8 flag = uint8(d2 >> 224);
+            
+            require(amount >= y2, "Fee token");
+            
+            if (flag & 2 == 0) {
+                IERC20(token1).approve(pair2, y2);
+                IUniswapV1Exchange(pair2).tokenToTrxSwapInput(y2, y3, block.timestamp);
+            } else {
+                IERC20(token1).transfer(pair2, y2);
+                uint amountOut0;
+                uint amountOut1;
+                (amountOut0, amountOut1) = (token1 < Constants.WRAPPED_TRX) ? (uint(0), y3) : (y3, uint(0));
+                
+                IUniswapV2Pair(pair2).swap(amountOut0, amountOut1, address(this), new bytes(0));
+            }
+            
+            if (flag == 0) {
+                IWETH(Constants.WRAPPED_TRX).deposit{value: y3 - x}();
+            } else if (flag == 1) {
+                IWETH(Constants.WRAPPED_TRX).deposit{value: y3}();
+            } else if (flag == 2) {
+                IWETH(Constants.WRAPPED_TRX).withdraw(x);
+            }
+            
+            if (flag & 1 == 0) {
+                IUniswapV1Exchange(pair0).trxToTokenTransferInput{value: x}(y1, block.timestamp, msg.sender);
+            } else {
+                IERC20(Constants.WRAPPED_TRX).transfer(pair0, x);
+                uint amountOut0;
+                uint amountOut1;
+                (amountOut0, amountOut1) = (Constants.WRAPPED_TRX < token0) ? (uint(0), y1) : (y1, uint(0));
+                
+                IUniswapV2Pair(pair0).swap(amountOut0, amountOut1, msg.sender, new bytes(0));
+            }
+        }
+        else {
+            revert();
+        }
+        
     }
-    
-    function destroy(address payable _to) external {
-        require(msg.sender == owner, "Not owner");
-        selfdestruct(_to);
-    }
-    
-    function changeOwner(address newOwner) external {
-        require(msg.sender == owner, "Not owner");
-        owner = newOwner;
-    }
-    
-    receive() payable external {}
+
+    receive() external payable {}
 }

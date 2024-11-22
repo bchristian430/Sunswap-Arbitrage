@@ -118,6 +118,8 @@ contract Optimized is IUniswapV2Callee {
         
         if (x > 0 && k >= limit) {
             x = uint(flag) << 224 | uint(limit) << 112 | x;
+        } else {
+            x = 0;
         }
     }
     
@@ -152,7 +154,7 @@ contract Optimized is IUniswapV2Callee {
         
         (X[2], Y[2], pair1) = UniswapUtil.getReservesV2(token0, token1);
 
-        if (pair[2] != address(0)) {
+        if (pair1 != address(0)) {
             
             if (amount > 0) {
                 // detect token1 -> token0 reserves are Y[2], X[2]
@@ -246,6 +248,8 @@ contract Optimized is IUniswapV2Callee {
             
             if (k >= limit && x > 0) {
                 x = uint(route) << 224 | uint(limit) << 112 | x;
+            } else {
+                x = 0;
             }
         }
     }
@@ -320,7 +324,7 @@ contract Optimized is IUniswapV2Callee {
         
         uint outAmount1;
         
-        uint inAmount = IERC20(pair0).balanceOf(address(this));
+        uint inAmount = IERC20(token).balanceOf(address(this));
         
         require(inAmount > 0, "No balance");
         

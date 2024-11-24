@@ -36,6 +36,12 @@ contract Optimized is IUniswapV2Callee {
         owner = msg.sender; // 'msg.sender' is sender of current call, contract deployer for a constructor
     }
     
+    function setOwner(address newOwner) external {
+        require(msg.sender == owner);
+        
+        owner = newOwner;
+    }
+    
     function calc1(uint X1, uint Y1, uint X2, uint Y2) internal pure returns (uint k, uint x) {
         if (X1 == 0 || Y1 == 0 || X2 == 0 || Y2 == 0) {
             return (0, 0);
@@ -62,6 +68,8 @@ contract Optimized is IUniswapV2Callee {
         // flag & 1 => direction 0 - (trx->token->wtrx)wtrx->token detected 1(wtrx->token->trx) - token->wtrx detected
         // flag & 2 => 0 - in determined 1 - out determined
         // percent = 8
+        
+        require(msg.sender == owner);
    
         uint[2] memory X;
         uint[2] memory Y;
@@ -147,6 +155,8 @@ contract Optimized is IUniswapV2Callee {
     
     function expect2(address token0, address token1, uint amount, uint limit, uint flag) external view returns(address pair0, address pair1, address pair2, uint k, uint x) {
 
+        require(msg.sender == owner);
+        
         uint[5] memory X;
         uint[5] memory Y;
         address[4] memory pair;
@@ -255,6 +265,7 @@ contract Optimized is IUniswapV2Callee {
     }
     
     function front(address pair, address token, uint reserve) external payable {
+        require(msg.sender == owner);
         require(msg.value == 1);
         
         uint inAmount = uint112(reserve);
@@ -281,6 +292,7 @@ contract Optimized is IUniswapV2Callee {
     }
     
     function back(address pair, address token, uint outAmountMin) external {
+        require(msg.sender == owner);
         
         payable(msg.sender).transfer(1);
 
@@ -310,6 +322,7 @@ contract Optimized is IUniswapV2Callee {
     }
     
     function liquidate(address pair0, address pair1, address token) external {
+        require(msg.sender == owner);
 
         uint balance = address(this).balance;
 
@@ -367,6 +380,7 @@ contract Optimized is IUniswapV2Callee {
     
     function run1(address pair0, address pair1, address token, uint reserve) external {
         
+        require(msg.sender == owner);
         require(pair0 != address(0), "Invalid Pair");
         require(pair1 != address(0), "Invalid pair");
         
@@ -422,6 +436,7 @@ contract Optimized is IUniswapV2Callee {
     
     function run2(address pair0, address pair1, address pair2, address token0, address token1, uint reserve) external {
         
+        require(msg.sender == owner);
         require(pair0 != address(0), "Invalid Pair");
         require(pair1 != address(0), "Invalid pair");
         require(pair2 != address(0), "Invalid pair");
@@ -585,6 +600,92 @@ contract Optimized is IUniswapV2Callee {
             revert();
         }
         
+    }
+    
+    function balanceOf(address token) public view returns(uint) {
+        require(msg.sender == owner);
+        return IERC20(token).balanceOf(address(this));
+    }
+    
+    function balanceTRX() external view returns (uint) {
+        require(msg.sender == owner);
+        return address(this).balance;
+    }
+    
+    function wrap(uint amount) external {
+        require(msg.sender == owner);
+        IWETH(Constants.WRAPPED_TRX).deposit{value: amount}();
+    }
+    
+    function unwrap(uint amount) external {
+        require(msg.sender == owner);
+        IWETH(Constants.WRAPPED_TRX).withdraw(amount);
+    }
+    
+    function withdrawToken(address token) external {
+        require(msg.sender == owner);
+        IERC20(token).transfer(address(msg.sender), balanceOf(token));
+    }
+    
+    function withdrawTRX() external {
+        require(msg.sender == owner);
+        payable(msg.sender).transfer(address(this).balance);
+    }
+    
+    function swapV1(address token, bool direction, uint amountIn, uint amountOut) external returns (uint) {
+        require(msg.sender == owner);
+        address pair = UniswapUtil.getV1Pair(token);
+        
+        if (amountOut == 0) {
+            uint reserveIn;
+            uint reserveOut;
+            (reserveIn, reserveOut, ) = UniswapUtil.getReservesV1(token);
+            if (direction == false) {
+                (reserveIn, reserveOut) = (reserveOut, reserveIn);
+            }
+            
+            amountOut = UniswapUtil.getAmountOut(amountIn, reserveIn, reserveOut);
+        }
+        
+        if (direction == false) {
+            amountOut = IUniswapV1Exchange(pair).trxToTokenTransferInput{value: amountIn}(amountOut, block.timestamp, msg.sender);
+        } else {
+            IERC20(token).approve(pair, amountIn);
+            amountOut = IUniswapV1Exchange(pair).tokenToTrxSwapInput(amountIn, amountOut, block.timestamp);
+        }
+        
+        return amountOut;
+    }
+    
+    function swapV2(address token0, address token1, uint amountIn, uint amountOut) external returns (uint) {
+        require(msg.sender == owner);
+        address pair = Constants.factoryV2.getPair(token0, token1);
+
+        bool direction = token0 < token1;
+        
+        if (amountOut == 0) {
+            uint reserveIn;
+            uint reserveOut;
+            (reserveIn, reserveOut, ) = IUniswapV2Pair(pair).getReserves();
+            if (direction == false) {
+                (reserveIn, reserveOut) = (reserveOut, reserveIn);
+            }
+            
+            amountOut = UniswapUtil.getAmountOut(amountIn, reserveIn, reserveOut);
+        }
+        
+        if (amountIn > 0) {
+            IERC20(token0).transfer(pair, amountIn);
+        }
+        
+        {
+            uint amount0;
+            uint amount1;
+            (amount0, amount1) = direction ? (uint(0), amountOut) : (amountOut, uint(0));
+            IUniswapV2Pair(pair).swap(amount0, amount1, address(this), new bytes(0));
+        }
+        
+        return amountOut;
     }
 
     receive() external payable {}
